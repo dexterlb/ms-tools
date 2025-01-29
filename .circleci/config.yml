@@ -1,0 +1,103 @@
+version: 2.1
+
+executors:
+  go:
+    docker:
+    - image: cimg/go:1.23
+  debian:
+    docker:
+    - image: debian:bookworm
+  ruby:
+    docker:
+    - image: cimg/ruby:3.4
+  github:
+    docker:
+    - image: cibuilds/github:0.13
+
+jobs:
+  build:
+    executor: debian
+    steps:
+    - run: apt-get update
+    - run: apt-get install -y git
+
+    # I have no idea why git fails locally otherwise, but...
+    - run: git config --global --add safe.directory /tmp/_circleci_local_build_repo
+    - checkout
+    - run: chown -R $(id -nu):$(id -ng) . # another fix for wrong permissions in local builds
+
+    - run: mkdir build
+    - run: apt-get install -y libudev-dev libhidapi-dev golang ca-certificates
+    - run: go build -o build/ms213x-cli github.com/BertoldVdb/ms-tools/cli
+    - persist_to_workspace:
+        root: .
+        paths:
+        - build
+    - store_artifacts:
+        path: build
+    - run: find build
+
+  package:
+    executor: ruby
+    steps:
+    - run: gem install fpm
+    - checkout
+    - attach_workspace:
+        at: .
+    - run: gem install package_cloud
+    - run: mkdir -v -p release
+    - run: >
+        fpm -n ms213x-cli -s dir -t deb -a amd64 -v ${CIRCLE_TAG#v} -p release \
+           build/ms213x-cli=/usr/bin/ \
+           README.md=/usr/share/doc/ms213x-cli/
+    - run: package_cloud push fosdem/video-team/debian/bookworm release/*deb
+    - store_artifacts:
+        path: release
+    - persist_to_workspace:
+        root: .
+        paths:
+        - release
+
+  release:
+    executor: github
+    steps:
+    - run: apk add fakeroot
+    - attach_workspace:
+        at: .
+    - run: mkdir -v -p release
+    - run: fakeroot tar -czvf release/ms213x-status-${CIRCLE_TAG}.amd64.tar.gz -C build ms213x-status
+    - run: cd release && sha256sum ms213x-status-*.tar.gz *deb > sha256sums.txt
+    - run: > 
+        ghr \
+          -u "${CIRCLE_PROJECT_USERNAME}" \
+          -r "${CIRCLE_PROJECT_REPONAME}" \
+          -c "${CIRCLE_SHA1}" \
+          -delete \
+          "${CIRCLE_TAG}" \
+          ./release/
+
+workflows:
+  build:
+    jobs:
+    - build:
+        filters:
+          tags:
+            only: /.*/
+    - package:
+        requires:
+        - build
+        filters:
+          tags:
+            only: /.*/
+          branches:
+            ignore: /.*/
+    - release:
+        requires:
+        - build
+        - package
+        filters:
+          tags:
+            only: /.*/
+          branches:
+            ignore: /.*/
+  version: 2
